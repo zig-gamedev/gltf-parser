@@ -18,8 +18,8 @@ pub const Node = struct {
     mesh: ?u16,
     children: []const u16,
     scale: [3]f32,
-    rotation: [3]f32,
     translation: [3]f32,
+    rotation: [4]f32,
 };
 
 pub const Mesh = struct {
@@ -28,10 +28,12 @@ pub const Mesh = struct {
 
 pub const Material = struct {
     pbr: ?PBR,
+    normal: ?Texture,
 
     const PBR = struct {
         base_color_factor: @Vector(4, f32),
-        base_color_texture: ?Texture,
+        base_color: ?Texture,
+        metallic_roughness: ?Texture,
     };
 };
 
@@ -68,8 +70,8 @@ const JsonChunk = struct {
         mesh: ?u16 = null,
         children: []u16 = &.{},
         scale: @Vector(3, f32) = .{ 1, 1, 1 },
-        rotation: @Vector(3, f32) = .{ 0, 0, 0 },
         translation: @Vector(3, f32) = .{ 0, 0, 0 },
+        rotation: @Vector(4, f32) = .{ 0, 0, 0, 1 },
     },
     meshes: []struct {
         primitives: []struct {
@@ -84,14 +86,18 @@ const JsonChunk = struct {
             indices: ?u16 = null,
             material: ?u16 = null,
         },
-    },
+    } = &.{},
     materials: []struct {
         name: ?[]const u8 = null,
         pbrMetallicRoughness: ?struct {
             baseColorFactor: @Vector(4, f32) = .{ 1, 1, 1, 1 },
-            baseColorTexture: ?struct {
-                index: u16,
-            } = null,
+            baseColorTexture: ?struct { index: u16 } = null,
+            metallicRoughnessTexture: ?struct { index: u16 } = null,
+        } = null,
+        normalTexture: ?struct {
+            index: u16,
+            scale: u16 = 1,
+            texcoord: u16 = 0,
         } = null,
     } = &.{},
     textures: []struct {
@@ -187,7 +193,7 @@ const Target = enum(u16) {
     ELEMENT_ARRAY_BUFFER = 34963,
 };
 
-pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
+pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bool) !GLTF {
     var fbs = std.io.fixedBufferStream(data);
     const reader = fbs.reader();
 
@@ -257,61 +263,66 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
 
     const out_nodes = try fba.alloc(Node, metadata.nodes.len);
     const out_meshes = try fba.alloc(Mesh, metadata.meshes.len);
-    const out_materials = try fba.alloc(Material, metadata.materials.len);
+    const out_materials = try fba.alloc(Material, if (no_materials) 0 else metadata.materials.len);
 
     alloc_zone.end();
 
     for (metadata.nodes, out_nodes) |node, *out_node| {
         out_node.* = .{
-            // According to tracy, even calls to alloc/dupe/free with 0 size has significant time costs
+            // According to tracy, even calls to alloc/dupe/free with 0 size has significant time cost
             .children = if (node.children.len > 0) try fba.dupe(u16, node.children) else &.{},
             .mesh = node.mesh,
             .scale = node.scale,
-            .rotation = node.rotation,
             .translation = node.translation,
+            .rotation = node.rotation,
         };
     }
 
-    for (metadata.materials, out_materials) |material, *out_material| {
-        if (material.pbrMetallicRoughness) |pbr| {
-            var base_color_texture: ?Texture = null;
-            if (pbr.baseColorTexture) |base_tex| {
-                const tex = metadata.textures[base_tex.index];
-                const img = metadata.images[tex.source];
-                const buffer_view = metadata.bufferViews[img.bufferView];
-                assert(buffer_view.byteStride == null);
+    if (!no_materials) {
+        for (metadata.materials, out_materials) |material, *out_material| {
+            var pbr: ?Material.PBR = null;
+            var normal: ?Texture = null;
+            if (material.pbrMetallicRoughness) |pbr_metallic_roughness| {
+                var base_color: ?Texture = null;
 
-                const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
-
-                var width: c_int = 0;
-                var height: c_int = 0;
-                var channels_in_file: c_int = 0;
-                var image: [:0]u8 = undefined;
-
-                if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
-                    const image_c = stbi.stbi_load_from_memory(
-                        ptr.ptr,
-                        @intCast(ptr.len),
-                        &width,
-                        &height,
-                        &channels_in_file,
-                        4,
-                    );
-                    image = @ptrCast(image_c[0..@intCast(width * height * 4 + 1)]);
+                if (pbr_metallic_roughness.baseColorTexture) |tex_index| {
+                    const tex = metadata.textures[tex_index.index];
+                    const img = metadata.images[tex.source];
+                    const buffer_view = metadata.bufferViews[img.bufferView];
+                    assert(buffer_view.byteStride == null);
+                    const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                    base_color = try loadTexture(ptr);
                 }
 
-                base_color_texture = .{
-                    .width = @intCast(width),
-                    .height = @intCast(height),
-                    .data = image,
+                var metallic_roughness: ?Texture = null;
+                if (pbr_metallic_roughness.metallicRoughnessTexture) |tex_index| {
+                    const tex = metadata.textures[tex_index.index];
+                    const img = metadata.images[tex.source];
+                    const buffer_view = metadata.bufferViews[img.bufferView];
+                    assert(buffer_view.byteStride == null);
+                    const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                    metallic_roughness = try loadTexture(ptr);
+                }
+
+                pbr = .{
+                    .base_color_factor = pbr_metallic_roughness.baseColorFactor,
+                    .base_color = base_color,
+                    .metallic_roughness = metallic_roughness,
                 };
             }
 
+            if (material.normalTexture) |tex_index| {
+                const tex = metadata.textures[tex_index.index];
+                const img = metadata.images[tex.source];
+                const buffer_view = metadata.bufferViews[img.bufferView];
+                assert(buffer_view.byteStride == null);
+                const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                normal = try loadTexture(ptr);
+            }
+
             out_material.* = .{
-                .pbr = .{
-                    .base_color_factor = pbr.baseColorFactor,
-                    .base_color_texture = base_color_texture,
-                },
+                .pbr = pbr,
+                .normal = normal,
             };
         }
     }
@@ -339,6 +350,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
                 .{ prim.attributes.POSITION, .position },
                 .{ prim.attributes.NORMAL, .normal },
                 .{ prim.attributes.TANGENT, .tangent },
+                .{ prim.attributes.COLOR_0, .color_0 },
                 .{ prim.attributes.TEXCOORD_0, .texcoord_0 },
                 .{ prim.attributes.TEXCOORD_1, .texcoord_1 },
             }) |entry| if (entry.@"0") |attr| {
@@ -434,7 +446,6 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
                                     .f32 => @bitCast(slice[0..@sizeOf([4]f32)].*),
                                     else => unreachable,
                                 };
-                                assert(color_0 >= .{ 0, 0, 0, 0 });
                             }
                         } else if (accessor.type == .VEC3) {
                             while (iter.next()) |slice| : (i += 1) {
@@ -445,7 +456,6 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
                                     else => unreachable,
                                 };
                                 color_0.?[i] = .{ color_rgb[0], color_rgb[1], color_rgb[2], 1 };
-                                assert(color_0 <= .{ 1, 1, 1, 1 });
                             }
                         } else unreachable;
                     },
@@ -475,9 +485,6 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8) !GLTF {
                     else => unreachable,
                 }
             };
-
-            // TODO: joints_0
-            // TODO: weights_0
 
             out_prim.* = .{
                 .material = prim.material,
@@ -510,9 +517,34 @@ pub fn deinit(gltf: GLTF, allocator: std.mem.Allocator) void {
     if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
         for (gltf.materials) |material| {
             if (material.pbr) |pbr| {
-                if (pbr.base_color_texture) |tex| stbi.stbi_image_free(tex.data.ptr);
+                if (pbr.base_color) |tex| stbi.stbi_image_free(tex.data.ptr);
             }
         }
     }
     allocator.free(gltf.fba_buf);
+}
+
+fn loadTexture(ptr: []const u8) !Texture {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels_in_file: c_int = 0;
+    var image: [:0]u8 = undefined;
+
+    if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
+        const image_c = stbi.stbi_load_from_memory(
+            ptr.ptr,
+            @intCast(ptr.len),
+            &width,
+            &height,
+            &channels_in_file,
+            4,
+        ) orelse return error.LoadingImageFailed;
+        image = @ptrCast(image_c[0..@intCast(width * height * 4 + 1)]);
+    }
+
+    return .{
+        .width = @intCast(width),
+        .height = @intCast(height),
+        .data = image,
+    };
 }
