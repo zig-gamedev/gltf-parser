@@ -16,6 +16,16 @@ pub fn build(b: *Build) void {
     const stb_dep = b.dependency("stb", .{});
     const tracy_dep = b.dependency("tracy", .{});
 
+    // STB
+    const stb_image_lib = b.addStaticLibrary(.{
+        .name = "stb_image",
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    stb_image_lib.linkLibC();
+    stb_image_lib.addIncludePath(stb_dep.path(""));
+    stb_image_lib.addCSourceFile(.{ .file = b.path("src/stb_image.c") });
+
     // STB Image Translate-C
     const stb_image_translate_c = b.addTranslateC(.{
         .root_source_file = stb_dep.path("stb_image.h"),
@@ -32,6 +42,7 @@ pub fn build(b: *Build) void {
     });
     module.addImport("build_options", build_options_module);
     module.addImport("stb_image", stb_image_translate_c.createModule());
+    module.linkLibrary(stb_image_lib);
 
     // Benchmark
     const benchmark = b.addExecutable(.{
