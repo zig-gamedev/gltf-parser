@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const stbi = @import("stb_image");
 const tracy = @import("tracy.zig");
 const assert = std.debug.assert;
+const eql = std.mem.eql;
 const bytesAsSlice = std.mem.bytesAsSlice;
+const stringToEnum = std.meta.stringToEnum;
 
 const GLTF = @This();
 
@@ -13,6 +15,7 @@ scene_nodes: []const u16,
 nodes: []const Node,
 meshes: []const Mesh,
 materials: []const Material,
+animations: []const Animation,
 
 pub const Node = struct {
     mesh: ?u16,
@@ -24,6 +27,19 @@ pub const Node = struct {
 
 pub const Mesh = struct {
     primitives: []Primitive,
+};
+
+pub const Primitive = struct {
+    indices: ?[]u32,
+    material: ?u16,
+    position: ?[]@Vector(3, f32),
+    normal: ?[]@Vector(3, f32),
+    tangent: ?[]@Vector(4, f32),
+    texcoord_0: ?[]@Vector(2, f32),
+    texcoord_1: ?[]@Vector(2, f32),
+    color_0: ?[]@Vector(4, f32),
+    joints_0: ?[]@Vector(4, u16),
+    weights_0: ?[]@Vector(4, f32),
 };
 
 pub const Material = struct {
@@ -43,17 +59,39 @@ pub const Texture = struct {
     data: [:0]u8,
 };
 
-pub const Primitive = struct {
-    indices: ?[]u32,
-    material: ?u16,
-    position: ?[]@Vector(3, f32),
-    normal: ?[]@Vector(3, f32),
-    tangent: ?[]@Vector(4, f32),
-    texcoord_0: ?[]@Vector(2, f32),
-    texcoord_1: ?[]@Vector(2, f32),
-    color_0: ?[]@Vector(4, f32),
-    joints_0: ?[]@Vector(4, u16),
-    weights_0: ?[]@Vector(4, f32),
+pub const Animation = struct {
+    name: ?[]const u8,
+    channels: []Channel,
+    samplers: []Sampler,
+
+    const Channel = struct {
+        sampler: u16,
+        target: Target,
+
+        const Target = struct {
+            node: ?u16,
+            path: Path,
+
+            const Path = enum {
+                translation,
+                rotation,
+                scale,
+                weights,
+            };
+        };
+    };
+
+    const Sampler = struct {
+        input: u16,
+        interpolation: Interpolation,
+        output: u16,
+
+        const Interpolation = enum {
+            linear,
+            step,
+            cubicspline,
+        };
+    };
 };
 
 const JsonChunk = struct {
@@ -109,13 +147,22 @@ const JsonChunk = struct {
         mimeType: []const u8,
         bufferView: u16,
     } = &.{},
-    accessors: []Accessor,
-    bufferViews: []BufferView,
-    buffers: []struct {
-        byteLength: usize,
+    animations: []struct {
+        name: ?[]const u8 = null,
+        channels: []struct {
+            sampler: u16,
+            target: struct {
+                node: ?u16 = null,
+                path: []const u8,
+            },
+        },
+        samplers: []struct {
+            input: u16,
+            interpolation: []const u8 = "LINEAR",
+            output: u16,
+        },
     },
-
-    const Accessor = struct {
+    accessors: []struct {
         bufferView: u16,
         type: Type,
         componentType: ComponentType,
@@ -125,15 +172,20 @@ const JsonChunk = struct {
         // NOTE: min/max is required for POSITION attribute
         min: ?[]f32 = null,
         max: ?[]f32 = null,
-    };
-
-    const BufferView = struct {
+    },
+    bufferViews: []struct {
         buffer: u16,
         byteLength: usize,
         byteOffset: usize = 0,
         byteStride: ?usize = null,
-        target: ?Target = null,
-    };
+        target: ?enum(u16) {
+            ARRAY_BUFFER = 34962,
+            ELEMENT_ARRAY_BUFFER = 34963,
+        } = null,
+    },
+    buffers: []struct {
+        byteLength: usize,
+    },
 };
 
 const Type = enum {
@@ -188,18 +240,18 @@ const ComponentType = enum(u16) {
     }
 };
 
-const Target = enum(u16) {
-    ARRAY_BUFFER = 34962,
-    ELEMENT_ARRAY_BUFFER = 34963,
+pub const Options = struct {
+    skip_materials: bool = false,
+    skip_animations: bool = false,
 };
 
-pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bool) !GLTF {
+pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options) !GLTF {
     var fbs = std.io.fixedBufferStream(data);
     const reader = fbs.reader();
 
     // Header
     const magic = try reader.readInt(u32, .little);
-    if (magic != 0x46546C67) return error.CorruptFile;
+    if (magic != 0x46546C67) return error.InvalidAsset;
 
     const version = try reader.readInt(u32, .little);
     if (version != 2) return error.OldGLTF;
@@ -209,16 +261,16 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
 
     // JSON Chunk
     var chunk_len = reader.readInt(u32, .little) catch |err| switch (err) {
-        error.EndOfStream => return error.CorruptFile,
+        error.EndOfStream => return error.InvalidAsset,
     };
-    if (chunk_len % 4 != 0) return error.CorruptFile;
+    if (chunk_len % 4 != 0) return error.InvalidAsset;
 
     const json_zone = tracy.trace(@src());
     json_zone.setName("JSON");
     json_zone.setColor(0xFFFF00);
 
     var chunk_type = try reader.readInt(u32, .little);
-    if (chunk_type != 0x4E4F534A) return error.CorruptFile;
+    if (chunk_type != 0x4E4F534A) return error.InvalidAsset;
 
     const json_bytes = try allocator.alloc(u8, chunk_len);
     defer allocator.free(json_bytes);
@@ -240,12 +292,12 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
 
     // Binary Chunk
     chunk_len = reader.readInt(u32, .little) catch |err| switch (err) {
-        error.EndOfStream => return error.CorruptFile,
+        error.EndOfStream => return error.InvalidAsset,
     };
-    if (chunk_len % 4 != 0) return error.CorruptFile;
+    if (chunk_len % 4 != 0) return error.InvalidAsset;
 
     chunk_type = try reader.readInt(u32, .little);
-    if (chunk_type != 0x004E4942) return error.CorruptFile;
+    if (chunk_type != 0x004E4942) return error.InvalidAsset;
 
     const buffer = data[fbs.pos..][0..metadata.buffers[0].byteLength];
 
@@ -256,6 +308,8 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
 
     // TODO: Precisely measure needed size
     const fba_buf = try allocator.alloc(u8, buffer.len * 4);
+    errdefer allocator.free(fba_buf);
+
     var fba_instance = std.heap.FixedBufferAllocator.init(fba_buf);
     const fba = fba_instance.allocator();
 
@@ -263,7 +317,8 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
 
     const out_nodes = try fba.alloc(Node, metadata.nodes.len);
     const out_meshes = try fba.alloc(Mesh, metadata.meshes.len);
-    const out_materials = try fba.alloc(Material, if (no_materials) 0 else metadata.materials.len);
+    const out_materials = try fba.alloc(Material, if (options.skip_materials) 0 else metadata.materials.len);
+    const out_animations = try fba.alloc(Animation, if (options.skip_animations) 0 else metadata.animations.len);
 
     alloc_zone.end();
 
@@ -278,7 +333,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
         };
     }
 
-    if (!no_materials) {
+    if (!options.skip_materials) {
         for (metadata.materials, out_materials) |material, *out_material| {
             var pbr: ?Material.PBR = null;
             var normal: ?Texture = null;
@@ -327,6 +382,54 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
         }
     }
 
+    if (!options.skip_animations) {
+        for (metadata.animations, out_animations) |animation, *out_animation| {
+            assert(animation.channels.len > 0);
+            const out_channels = try fba.alloc(Animation.Channel, animation.channels.len);
+
+            for (animation.channels, out_channels) |channel, *out_channel| {
+                const path = stringToEnum(Animation.Channel.Target.Path, channel.target.path) orelse return error.InvalidAsset;
+                out_channel.* = .{
+                    .sampler = channel.sampler,
+                    .target = .{
+                        .node = channel.target.node,
+                        .path = path,
+                    },
+                };
+            }
+
+            assert(animation.samplers.len > 0);
+            const out_samplers = try fba.alloc(Animation.Sampler, animation.samplers.len);
+
+            for (animation.samplers, out_samplers) |sampler, *out_sampler| {
+                // interpolation values doesn't match with enum naming convention,
+                // so we can't compare them with `stringToEnum`.
+                const interpolation: Animation.Sampler.Interpolation = blk: {
+                    if (eql(u8, sampler.interpolation, "LINEAR")) {
+                        break :blk .linear;
+                    } else if (eql(u8, sampler.interpolation, "STEP")) {
+                        break :blk .step;
+                    } else if (eql(u8, sampler.interpolation, "CUBICSPLINE")) {
+                        break :blk .cubicspline;
+                    }
+                    return error.InvalidAsset;
+                };
+
+                out_sampler.* = .{
+                    .input = sampler.input,
+                    .interpolation = interpolation,
+                    .output = sampler.output,
+                };
+            }
+
+            out_animation.* = .{
+                .name = animation.name,
+                .channels = out_channels,
+                .samplers = out_samplers,
+            };
+        }
+    }
+
     for (metadata.meshes, out_meshes) |mesh, *out_mesh| {
         assert(mesh.primitives.len > 0);
         const out_primitives = try fba.alloc(Primitive, mesh.primitives.len);
@@ -361,12 +464,26 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
                 trace.setColor(@bitCast([_]u8{ attr_name[0], attr_name[1], attr_name[2], attr_name[attr_name.len - 1] }));
 
                 const accessor = metadata.accessors[attr];
-                const item_size = accessor.type.size(accessor.componentType);
-                const buffer_view = metadata.bufferViews[accessor.bufferView];
-                const stride = buffer_view.byteStride orelse item_size;
-                const ptr = buffer[accessor.byteOffset + buffer_view.byteOffset ..][0..buffer_view.byteLength];
-                assert(buffer_view.byteLength == accessor.count * stride);
                 assert(accessor.count > 0);
+                assert(accessor.byteOffset % 4 == 0);
+
+                const buffer_view = metadata.bufferViews[accessor.bufferView];
+                const item_size = accessor.type.size(accessor.componentType);
+                const stride = blk: {
+                    if (buffer_view.byteStride) |stride| {
+                        // Must be aligned to 4-byte
+                        assert(stride % 4 == 0);
+                        assert(stride >= 4 and stride <= 252);
+                        break :blk stride;
+                    }
+                    // Data is tightly packed
+                    break :blk item_size;
+                };
+
+                const total_size = stride * (accessor.count - 1) + item_size;
+                assert(accessor.byteOffset + total_size <= buffer_view.byteLength);
+
+                const ptr = buffer[buffer_view.byteOffset + accessor.byteOffset ..][0..total_size];
 
                 var iter = std.mem.window(u8, ptr, item_size, stride);
                 var i: usize = 0;
@@ -510,6 +627,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, no_materials: bo
         .nodes = out_nodes,
         .meshes = out_meshes,
         .materials = out_materials,
+        .animations = out_animations,
     };
 }
 
