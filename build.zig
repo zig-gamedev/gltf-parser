@@ -8,12 +8,7 @@ pub fn build(b: *Build) void {
 
     const build_options = b.addOptions();
     const build_options_module = build_options.createModule();
-    const enable_tracy = b.option(bool, "tracy", "Enable tracy") orelse false;
-    const enable_tracy_callstack = b.option(bool, "tracy_callstack", "Enable tracy callstack") orelse enable_tracy;
-    build_options.addOption(bool, "enable_tracy", enable_tracy);
-    build_options.addOption(bool, "enable_tracy_callstack", enable_tracy_callstack);
     const stb_dep = b.dependency("stb", .{});
-    const tracy_dep = b.dependency("tracy", .{});
 
     const test_cmd = b.step("test", "Run test");
     const benchmark_cmd = b.step("benchmark", "Run benchmark");
@@ -67,12 +62,6 @@ pub fn build(b: *Build) void {
     benchmark.linkLibCpp();
     benchmark.addIncludePath(stb_dep.path(""));
     benchmark.addCSourceFile(.{ .file = b.path("src/stb_image.c") });
-    if (enable_tracy) {
-        benchmark.addCSourceFile(.{
-            .file = tracy_dep.path("public/TracyClient.cpp"),
-            .flags = &.{ "-DTRACY_ENABLE", "-fno-sanitize=undefined" },
-        });
-    }
 
     const install_benchmark_exe_cmd = b.addInstallArtifact(benchmark, .{});
     benchmark_cmd.dependOn(&install_benchmark_exe_cmd.step);

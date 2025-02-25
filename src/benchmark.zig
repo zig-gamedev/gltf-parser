@@ -11,10 +11,10 @@ const Command = enum {
     @"-r",
 };
 
-const DEFAULT_RUNS = if (build_options.enable_tracy) 1 else 500;
+const DEFAULT_RUNS = 500;
 
 pub fn main() !u8 {
-    const allocator = std.heap.c_allocator;
+    const allocator = std.heap.smp_allocator;
     const stdout = std.io.getStdOut().writer();
     var args = try std.process.argsWithAllocator(allocator);
     const exe_path = args.next().?;
@@ -76,7 +76,10 @@ pub fn main() !u8 {
     const runs_node = progress.start("Run", runs.?);
     for (0..runs.?) |_| {
         timer.reset();
-        const model = try gltf.parseGLB(allocator, data, .{});
+        var bm: gltf.DefaultBufferManager = .empty;
+        const dirname = std.fs.path.dirname(asset_path.?) orelse "";
+        bm.cwd = try std.fs.cwd().openDir(dirname, .{});
+        const model = try gltf.parse(allocator, data, &bm, gltf.DefaultBufferManager.loadBuffer, .{});
         defer model.deinit(allocator);
         const took = timer.read();
         min = @min(took, min);
