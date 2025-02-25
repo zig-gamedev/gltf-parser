@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stbi = @import("stb_image");
 const tracy = @import("tracy.zig");
-const assert = std.debug.assert;
 const eql = std.mem.eql;
 const bytesAsSlice = std.mem.bytesAsSlice;
 const stringToEnum = std.meta.stringToEnum;
@@ -10,23 +9,33 @@ const stringToEnum = std.meta.stringToEnum;
 const GLTF = @This();
 
 fba_buf: []u8,
-scene_name: []const u8,
-scene_nodes: []const u16,
-nodes: []const Node,
-meshes: []const Mesh,
-materials: []const Material,
-animations: []const Animation,
+scene_name: ?[]u8,
+scene_nodes: []u16,
+nodes: []Node,
+meshes: []Mesh,
+skins: []Skin,
+materials: []Material,
+animations: []Animation,
 
 pub const Node = struct {
     mesh: ?u16,
-    children: []const u16,
+    skin: ?u16,
+    children: []u16,
     scale: [3]f32,
     translation: [3]f32,
     rotation: [4]f32,
+    weights: [2]f32,
 };
 
 pub const Mesh = struct {
     primitives: []Primitive,
+};
+
+pub const Skin = struct {
+    joints: []u16,
+    name: ?[]const u8 = null,
+    inverse_bind_matrices: ?u16,
+    skeleton: ?u16,
 };
 
 pub const Primitive = struct {
@@ -96,20 +105,22 @@ pub const Animation = struct {
 
 const JsonChunk = struct {
     asset: struct {
-        generator: ?[]const u8 = null,
-        version: []const u8,
+        generator: ?[]u8 = null,
+        version: []u8,
     },
     scene: u16,
     scenes: []struct {
-        name: []const u8 = "Main Scene",
+        name: ?[]u8 = null,
         nodes: []u16,
     },
     nodes: []struct {
         mesh: ?u16 = null,
+        skin: ?u16 = null,
         children: []u16 = &.{},
         scale: @Vector(3, f32) = .{ 1, 1, 1 },
         translation: @Vector(3, f32) = .{ 0, 0, 0 },
         rotation: @Vector(4, f32) = .{ 0, 0, 0, 1 },
+        weights: @Vector(2, f32) = .{ 0, 0 },
     },
     meshes: []struct {
         primitives: []struct {
@@ -125,8 +136,14 @@ const JsonChunk = struct {
             material: ?u16 = null,
         },
     } = &.{},
+    skins: []struct {
+        joints: []u16,
+        name: ?[]u8 = null,
+        inverse_bind_matrices: ?u16 = null,
+        skeleton: ?u16 = null,
+    } = &.{},
     materials: []struct {
-        name: ?[]const u8 = null,
+        name: ?[]u8 = null,
         pbrMetallicRoughness: ?struct {
             baseColorFactor: @Vector(4, f32) = .{ 1, 1, 1, 1 },
             baseColorTexture: ?struct { index: u16 } = null,
@@ -143,22 +160,22 @@ const JsonChunk = struct {
         source: u16,
     } = &.{},
     images: []struct {
-        name: ?[]const u8 = null,
-        mimeType: []const u8,
+        name: ?[]u8 = null,
+        mimeType: []u8,
         bufferView: u16,
     } = &.{},
     animations: []struct {
-        name: ?[]const u8 = null,
+        name: ?[]u8 = null,
         channels: []struct {
             sampler: u16,
             target: struct {
                 node: ?u16 = null,
-                path: []const u8,
+                path: []u8,
             },
         },
         samplers: []struct {
             input: u16,
-            interpolation: []const u8 = "LINEAR",
+            interpolation: ?[]u8 = null,
             output: u16,
         },
     } = &.{},
@@ -240,9 +257,15 @@ const ComponentType = enum(u16) {
     }
 };
 
+pub const Error = error{
+    InvalidHeader,
+    InvalidAsset,
+};
+
 pub const Options = struct {
     skip_materials: bool = false,
     skip_animations: bool = false,
+    skip_skins: bool = false,
 };
 
 pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options) !GLTF {
@@ -251,13 +274,13 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
 
     // Header
     const magic = try reader.readInt(u32, .little);
-    if (magic != 0x46546C67) return error.InvalidAsset;
+    if (magic != 0x46546C67) return error.InvalidHeader;
 
     const version = try reader.readInt(u32, .little);
     if (version != 2) return error.OldGLTF;
 
     const length = try reader.readInt(u32, .little);
-    assert(length > 12);
+    if (length <= 12) return error.InvalidHeader;
 
     // JSON Chunk
     var chunk_len = reader.readInt(u32, .little) catch |err| switch (err) {
@@ -276,7 +299,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
     defer allocator.free(json_bytes);
 
     const read_len = try reader.read(json_bytes);
-    assert(read_len == chunk_len);
+    if (read_len != chunk_len) return error.InvalidAsset;
 
     const json_res = try std.json.parseFromSlice(
         JsonChunk,
@@ -317,6 +340,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
 
     const out_nodes = try fba.alloc(Node, metadata.nodes.len);
     const out_meshes = try fba.alloc(Mesh, metadata.meshes.len);
+    const out_skins = try fba.alloc(Skin, if (options.skip_skins) 0 else metadata.skins.len);
     const out_materials = try fba.alloc(Material, if (options.skip_materials) 0 else metadata.materials.len);
     const out_animations = try fba.alloc(Animation, if (options.skip_animations) 0 else metadata.animations.len);
 
@@ -327,9 +351,11 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
             // According to tracy, even calls to alloc/dupe/free with 0 size has significant time cost
             .children = if (node.children.len > 0) try fba.dupe(u16, node.children) else &.{},
             .mesh = node.mesh,
+            .skin = node.skin,
             .scale = node.scale,
             .translation = node.translation,
             .rotation = node.rotation,
+            .weights = node.weights,
         };
     }
 
@@ -344,7 +370,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                     const tex = metadata.textures[tex_index.index];
                     const img = metadata.images[tex.source];
                     const buffer_view = metadata.bufferViews[img.bufferView];
-                    assert(buffer_view.byteStride == null);
+                    if (buffer_view.byteStride != null) return error.InvalidAsset;
                     const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
                     base_color = try loadTexture(ptr);
                 }
@@ -354,7 +380,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                     const tex = metadata.textures[tex_index.index];
                     const img = metadata.images[tex.source];
                     const buffer_view = metadata.bufferViews[img.bufferView];
-                    assert(buffer_view.byteStride == null);
+                    if (buffer_view.byteStride != null) return error.InvalidAsset;
                     const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
                     metallic_roughness = try loadTexture(ptr);
                 }
@@ -370,7 +396,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                 const tex = metadata.textures[tex_index.index];
                 const img = metadata.images[tex.source];
                 const buffer_view = metadata.bufferViews[img.bufferView];
-                assert(buffer_view.byteStride == null);
+                if (buffer_view.byteStride != null) return error.InvalidAsset;
                 const ptr = buffer[buffer_view.byteOffset..][0..buffer_view.byteLength];
                 normal = try loadTexture(ptr);
             }
@@ -384,7 +410,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
 
     if (!options.skip_animations) {
         for (metadata.animations, out_animations) |animation, *out_animation| {
-            assert(animation.channels.len > 0);
+            if (animation.channels.len == 0) return error.InvalidAsset;
             const out_channels = try fba.alloc(Animation.Channel, animation.channels.len);
 
             for (animation.channels, out_channels) |channel, *out_channel| {
@@ -398,21 +424,24 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                 };
             }
 
-            assert(animation.samplers.len > 0);
+            if (animation.samplers.len == 0) return error.InvalidAsset;
             const out_samplers = try fba.alloc(Animation.Sampler, animation.samplers.len);
 
             for (animation.samplers, out_samplers) |sampler, *out_sampler| {
                 // interpolation values doesn't match with enum naming convention,
                 // so we can't compare them with `stringToEnum`.
                 const interpolation: Animation.Sampler.Interpolation = blk: {
-                    if (eql(u8, sampler.interpolation, "LINEAR")) {
-                        break :blk .linear;
-                    } else if (eql(u8, sampler.interpolation, "STEP")) {
-                        break :blk .step;
-                    } else if (eql(u8, sampler.interpolation, "CUBICSPLINE")) {
-                        break :blk .cubicspline;
+                    if (sampler.interpolation) |intr| {
+                        if (eql(u8, intr, "LINEAR")) {
+                            break :blk .linear;
+                        } else if (eql(u8, intr, "STEP")) {
+                            break :blk .step;
+                        } else if (eql(u8, intr, "CUBICSPLINE")) {
+                            break :blk .cubicspline;
+                        }
+                        return error.InvalidAsset;
                     }
-                    return error.InvalidAsset;
+                    break :blk .linear;
                 };
 
                 out_sampler.* = .{
@@ -430,10 +459,23 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
         }
     }
 
-    for (metadata.meshes, out_meshes) |mesh, *out_mesh| {
-        assert(mesh.primitives.len > 0);
-        const out_primitives = try fba.alloc(Primitive, mesh.primitives.len);
+    if (!options.skip_skins) {
+        for (metadata.skins, out_skins) |skin, *out_skin| {
+            if (skin.joints.len == 0) return error.InvalidAsset;
 
+            out_skin.* = .{
+                .joints = skin.joints,
+                .name = skin.name,
+                .inverse_bind_matrices = skin.inverse_bind_matrices,
+                .skeleton = skin.skeleton,
+            };
+        }
+    }
+
+    for (metadata.meshes, out_meshes) |mesh, *out_mesh| {
+        if (mesh.primitives.len == 0) return error.InvalidAsset;
+
+        const out_primitives = try fba.alloc(Primitive, mesh.primitives.len);
         for (mesh.primitives, out_primitives) |prim, *out_prim| {
             var indices: ?[]u32 = null;
             var position: ?[]@Vector(3, f32) = null;
@@ -444,9 +486,6 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
             var color_0: ?[]@Vector(4, f32) = null;
             var joints_0: ?[]@Vector(4, u16) = null;
             var weights_0: ?[]@Vector(4, f32) = null;
-
-            _ = &joints_0;
-            _ = &weights_0;
 
             inline for (&.{
                 .{ prim.indices, .index },
@@ -464,16 +503,16 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                 trace.setColor(@bitCast([_]u8{ attr_name[0], attr_name[1], attr_name[2], attr_name[attr_name.len - 1] }));
 
                 const accessor = metadata.accessors[attr];
-                assert(accessor.count > 0);
-                assert(accessor.byteOffset % 4 == 0);
+                if (accessor.count == 0) return error.InvalidAsset;
+                if (accessor.byteOffset % 4 != 0) return error.InvalidAsset;
 
                 const buffer_view = metadata.bufferViews[accessor.bufferView];
                 const item_size = accessor.type.size(accessor.componentType);
                 const stride = blk: {
                     if (buffer_view.byteStride) |stride| {
                         // Must be aligned to 4-byte
-                        assert(stride % 4 == 0);
-                        assert(stride >= 4 and stride <= 252);
+                        if (stride % 4 != 0) return error.InvalidAsset;
+                        if (stride < 4 or stride > 252) return error.InvalidAsset;
                         break :blk stride;
                     }
                     // Data is tightly packed
@@ -481,7 +520,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                 };
 
                 const total_size = stride * (accessor.count - 1) + item_size;
-                assert(accessor.byteOffset + total_size <= buffer_view.byteLength);
+                if (accessor.byteOffset + total_size > buffer_view.byteLength) return error.InvalidAsset;
 
                 const ptr = buffer[buffer_view.byteOffset + accessor.byteOffset ..][0..total_size];
 
@@ -490,7 +529,8 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
 
                 switch (entry.@"1") {
                     .index => {
-                        assert(accessor.type == .SCALAR);
+                        if (accessor.type != .SCALAR) return error.InvalidAsset;
+
                         indices = try fba.alloc(u32, accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             indices.?[i] = switch (accessor.componentType) {
@@ -499,38 +539,39 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                                 .u32 => @as(u32, @bitCast(slice[0..@sizeOf(u32)].*)),
                                 else => unreachable,
                             };
-                            assert(indices.?[i] != accessor.componentType.max());
+                            if (indices.?[i] == accessor.componentType.max()) return error.InvalidAsset;
                         }
                     },
                     .position => {
-                        assert(accessor.type == .VEC3);
-                        assert(accessor.componentType == .f32);
-                        assert(accessor.min != null);
-                        assert(accessor.max != null);
+                        if (accessor.type != .VEC3) return error.InvalidAsset;
+                        if (accessor.componentType != .f32) return error.InvalidAsset;
+                        if (accessor.min == null) return error.InvalidAsset;
+                        if (accessor.max == null) return error.InvalidAsset;
+
                         position = try fba.alloc(@Vector(3, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             position.?[i] = @bitCast(slice[0..@sizeOf([3]f32)].*);
                         }
                     },
                     .normal => {
-                        assert(accessor.type == .VEC3);
-                        assert(accessor.componentType == .f32);
+                        if (accessor.type != .VEC3) return error.InvalidAsset;
+                        if (accessor.componentType != .f32) return error.InvalidAsset;
                         normal = try fba.alloc(@Vector(3, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             normal.?[i] = @bitCast(slice[0..@sizeOf([3]f32)].*);
                         }
                     },
                     .tangent => {
-                        assert(accessor.type == .VEC4);
-                        assert(accessor.componentType == .f32);
+                        if (accessor.type != .VEC4) return error.InvalidAsset;
+                        if (accessor.componentType != .f32) return error.InvalidAsset;
                         tangent = try fba.alloc(@Vector(4, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             tangent.?[i] = @bitCast(slice[0..@sizeOf([4]f32)].*);
-                            assert(tangent.?[i][3] >= -1 and tangent.?[i][3] <= 1);
+                            if (tangent.?[i][3] < -1 or tangent.?[i][3] > 1) return error.InvalidAsset;
                         }
                     },
                     .texcoord_0 => {
-                        assert(accessor.type == .VEC2);
+                        if (accessor.type != .VEC2) return error.InvalidAsset;
                         texcoord_0 = try fba.alloc(@Vector(2, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             texcoord_0.?[i] = switch (accessor.componentType) {
@@ -542,7 +583,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                         }
                     },
                     .texcoord_1 => {
-                        assert(accessor.type == .VEC2);
+                        if (accessor.type != .VEC2) return error.InvalidAsset;
                         texcoord_1 = try fba.alloc(@Vector(2, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             texcoord_1.?[i] = switch (accessor.componentType) {
@@ -577,7 +618,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                         } else unreachable;
                     },
                     .joints_0 => {
-                        assert(accessor.type == .VEC4);
+                        if (accessor.type != .VEC4) return error.InvalidAsset;
                         joints_0 = try fba.alloc(@Vector(4, u16), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             joints_0.?[i] = switch (accessor.componentType) {
@@ -588,7 +629,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
                         }
                     },
                     .weights_0 => {
-                        assert(accessor.type == .VEC4);
+                        if (accessor.type != .VEC4) return error.InvalidAsset;
                         weights_0 = try fba.alloc(@Vector(4, f32), accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
                             weights_0.?[i] = switch (accessor.componentType) {
@@ -626,6 +667,7 @@ pub fn parseGLB(allocator: std.mem.Allocator, data: []const u8, options: Options
         .scene_nodes = try fba.dupe(u16, scene.nodes),
         .nodes = out_nodes,
         .meshes = out_meshes,
+        .skins = out_skins,
         .materials = out_materials,
         .animations = out_animations,
     };
