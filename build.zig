@@ -12,9 +12,11 @@ pub fn build(b: *Build) void {
     const enable_tracy_callstack = b.option(bool, "tracy_callstack", "Enable tracy callstack") orelse enable_tracy;
     build_options.addOption(bool, "enable_tracy", enable_tracy);
     build_options.addOption(bool, "enable_tracy_callstack", enable_tracy_callstack);
-
     const stb_dep = b.dependency("stb", .{});
     const tracy_dep = b.dependency("tracy", .{});
+
+    const test_cmd = b.step("test", "Run test");
+    const benchmark_cmd = b.step("benchmark", "Run benchmark");
 
     // STB
     const stb_image_lib = b.addStaticLibrary(.{
@@ -44,12 +46,21 @@ pub fn build(b: *Build) void {
     module.addImport("stb_image", stb_image_translate_c.createModule());
     module.linkLibrary(stb_image_lib);
 
+    // Test
+    const test_step = b.addTest(.{
+        .root_module = module,
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_test = b.addRunArtifact(test_step);
+    test_cmd.dependOn(&run_test.step);
+
     // Benchmark
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
         .root_source_file = b.path("src/benchmark.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
     benchmark.root_module.addImport("gltf", module);
     benchmark.root_module.addImport("build_options", build_options_module);
@@ -64,8 +75,9 @@ pub fn build(b: *Build) void {
     }
 
     const install_benchmark_exe_cmd = b.addInstallArtifact(benchmark, .{});
+    benchmark_cmd.dependOn(&install_benchmark_exe_cmd.step);
+
     const run_benchmark = b.addRunArtifact(benchmark);
-    const test_gltf_step = b.step("benchmark", "Run Benchmark");
-    test_gltf_step.dependOn(&install_benchmark_exe_cmd.step);
-    test_gltf_step.dependOn(&run_benchmark.step);
+    run_benchmark.addArgs(b.args orelse &.{});
+    benchmark_cmd.dependOn(&run_benchmark.step);
 }

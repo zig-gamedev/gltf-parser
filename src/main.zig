@@ -161,7 +161,7 @@ const JsonChunk = struct {
             interpolation: []const u8 = "LINEAR",
             output: u16,
         },
-    },
+    } = &.{},
     accessors: []struct {
         bufferView: u16,
         type: Type,
