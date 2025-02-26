@@ -1,15 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stbi = @import("stb_image");
-const Allocator = std.mem.Allocator;
-const FixedBufferAllocator = std.heap.FixedBufferAllocator;
-const base64 = std.base64.url_safe;
-const eql = std.mem.eql;
+const heap = std.heap;
+const mem = std.mem;
+const base64 = std.base64.standard;
 const assert = std.debug.assert;
+const nativeToLittle = mem.nativeToLittle;
 
 const GLTF = @This();
 
-fba_buf: []u8,
+arena: heap.ArenaAllocator,
 scene_name: ?[]u8,
 scene_nodes: []u16,
 nodes: []Node,
@@ -132,6 +132,8 @@ const Metadata = struct {
                 TEXCOORD_0: ?u16 = null,
                 TEXCOORD_1: ?u16 = null,
                 COLOR_0: ?u16 = null,
+                JOINTS_0: ?u16 = null,
+                WEIGHTS_0: ?u16 = null,
             },
             indices: ?u16 = null,
             material: ?u16 = null,
@@ -214,6 +216,17 @@ const Metadata = struct {
         MAT3,
         MAT4,
 
+        fn ZigType(comptime ty: Type, comptime comp_type: ComponentType) type {
+            return switch (ty) {
+                .SCALAR => comp_type.ZigType(),
+                .VEC2 => @Vector(2, comp_type.ZigType()),
+                .VEC3 => @Vector(3, comp_type.ZigType()),
+                .VEC4 => @Vector(4, comp_type.ZigType()),
+                .MAT3 => [3]@Vector(3, comp_type.ZigType()),
+                .MAT4 => [4]@Vector(4, comp_type.ZigType()),
+            };
+        }
+
         fn len(ty: Type) u8 {
             return switch (ty) {
                 .SCALAR => 1,
@@ -225,8 +238,8 @@ const Metadata = struct {
             };
         }
 
-        fn size(ty: Type, component_type: ComponentType) u8 {
-            return ty.len() * component_type.size();
+        fn size(ty: Type, comp_type: ComponentType) u8 {
+            return ty.len() * comp_type.size();
         }
     };
 
@@ -238,16 +251,27 @@ const Metadata = struct {
         u32 = 5125,
         f32 = 5126,
 
-        fn size(component_type: ComponentType) u8 {
-            return switch (component_type) {
+        fn ZigType(comptime comp_type: ComponentType) type {
+            return switch (comp_type) {
+                .i8 => i8,
+                .u8 => u8,
+                .i16 => i16,
+                .u16 => u16,
+                .u32 => u32,
+                .f32 => f32,
+            };
+        }
+
+        fn size(comp_type: ComponentType) u8 {
+            return switch (comp_type) {
                 .i8, .u8 => 1,
                 .i16, .u16 => 2,
                 .u32, .f32 => 4,
             };
         }
 
-        fn max(component_type: ComponentType) u32 {
-            return switch (component_type) {
+        fn max(comp_type: ComponentType) u32 {
+            return switch (comp_type) {
                 .i8 => std.math.maxInt(i8),
                 .u8 => std.math.maxInt(u8),
                 .i16 => std.math.maxInt(i16),
@@ -280,12 +304,12 @@ pub const DefaultBufferManager = struct {
 
     pub fn loadUri(
         bm: *DefaultBufferManager,
-        allocator: Allocator,
+        allocator: mem.Allocator,
         uri: []const u8,
         len: u32,
     ) error{LoadingAsset}![]const u8 {
         if (std.Uri.parse(uri)) |puri| {
-            const i = std.mem.indexOf(u8, puri.path.percent_encoded, "base64,") orelse return error.LoadingAsset;
+            const i = mem.indexOf(u8, puri.path.percent_encoded, "base64,") orelse return error.LoadingAsset;
             const base64_data = puri.path.percent_encoded[i + 7 ..];
             const base64_len = base64.Decoder.calcSizeForSlice(base64_data) catch return error.LoadingAsset;
             const data = allocator.alloc(u8, base64_len) catch return error.LoadingAsset;
@@ -301,10 +325,10 @@ pub const DefaultBufferManager = struct {
 };
 
 pub fn parse(
-    gpa: Allocator,
+    gpa: mem.Allocator,
     data: []const u8,
     ctx: anytype,
-    loadUri: *const fn (ctx: @TypeOf(ctx), allocator: Allocator, uri: []const u8, len: u32) error{LoadingAsset}![]const u8,
+    loadUri: *const fn (ctx: @TypeOf(ctx), allocator: mem.Allocator, uri: []const u8, len: u32) error{LoadingAsset}![]const u8,
     options: Options,
 ) Error!GLTF {
     var fbs = std.io.fixedBufferStream(data);
@@ -367,10 +391,11 @@ pub fn parse(
         for (metadata.meshes) |mesh| alloc_size += @sizeOf(Mesh) + @sizeOf(Primitive) * mesh.primitives.len;
         break :blk alloc_size;
     };
-    const fba_buf = try gpa.alloc(u8, alloc_size);
-    errdefer gpa.free(fba_buf);
 
-    var fallback_allocator: FallbackAllocator = .{ .fallback = gpa, .fba = .init(fba_buf) };
+    var arena: heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const fba_buf = try arena.allocator().alloc(u8, alloc_size);
+    var fallback_allocator: FallbackAllocator = .{ .fallback = arena.allocator(), .fba = .init(fba_buf) };
     const allocator = fallback_allocator.allocator();
 
     // Parse accessors/images/etc
@@ -465,13 +490,13 @@ pub fn parse(
 
             for (animation.channels, out_channels) |channel, *out_channel| {
                 const path: Animation.Channel.Target.Path = blk: {
-                    if (eql(u8, channel.target.path, "translation")) {
+                    if (mem.eql(u8, channel.target.path, "translation")) {
                         break :blk .translation;
-                    } else if (eql(u8, channel.target.path, "rotation")) {
+                    } else if (mem.eql(u8, channel.target.path, "rotation")) {
                         break :blk .rotation;
-                    } else if (eql(u8, channel.target.path, "scale")) {
+                    } else if (mem.eql(u8, channel.target.path, "scale")) {
                         break :blk .scale;
-                    } else if (eql(u8, channel.target.path, "weights")) {
+                    } else if (mem.eql(u8, channel.target.path, "weights")) {
                         break :blk .weights;
                     }
                     return error.InvalidAsset;
@@ -491,11 +516,11 @@ pub fn parse(
             for (animation.samplers, out_samplers) |sampler, *out_sampler| {
                 const interpolation: Animation.Sampler.Interpolation = blk: {
                     if (sampler.interpolation) |intr| {
-                        if (eql(u8, intr, "LINEAR")) {
+                        if (mem.eql(u8, intr, "LINEAR")) {
                             break :blk .linear;
-                        } else if (eql(u8, intr, "STEP")) {
+                        } else if (mem.eql(u8, intr, "STEP")) {
                             break :blk .step;
-                        } else if (eql(u8, intr, "CUBICSPLINE")) {
+                        } else if (mem.eql(u8, intr, "CUBICSPLINE")) {
                             break :blk .cubicspline;
                         }
                         return error.InvalidAsset;
@@ -536,28 +561,45 @@ pub fn parse(
 
         const out_primitives = try allocator.alloc(Primitive, mesh.primitives.len);
         for (mesh.primitives, out_primitives) |prim, *out_prim| {
-            var indices: ?[]u32 = null;
-            var position: ?[]@Vector(3, f32) = null;
-            var normal: ?[]@Vector(3, f32) = null;
-            var tangent: ?[]@Vector(4, f32) = null;
-            var texcoord_0: ?[]@Vector(2, f32) = null;
-            var texcoord_1: ?[]@Vector(2, f32) = null;
-            var color_0: ?[]@Vector(4, f32) = null;
-            var joints_0: ?[]@Vector(4, u16) = null;
-            var weights_0: ?[]@Vector(4, f32) = null;
+            var attrs: struct {
+                indices: ?[]u32 = null,
+                position: ?[]@Vector(3, f32) = null,
+                normal: ?[]@Vector(3, f32) = null,
+                tangent: ?[]@Vector(4, f32) = null,
+                texcoord_0: ?[]@Vector(2, f32) = null,
+                texcoord_1: ?[]@Vector(2, f32) = null,
+                color_0: ?[]@Vector(4, f32) = null,
+                joints_0: ?[]@Vector(4, u16) = null,
+                weights_0: ?[]@Vector(4, f32) = null,
+            } = .{};
 
             inline for (&.{
-                .{ prim.indices, .index },
-                .{ prim.attributes.POSITION, .position },
-                .{ prim.attributes.NORMAL, .normal },
-                .{ prim.attributes.TANGENT, .tangent },
-                .{ prim.attributes.COLOR_0, .color_0 },
-                .{ prim.attributes.TEXCOORD_0, .texcoord_0 },
-                .{ prim.attributes.TEXCOORD_1, .texcoord_1 },
-            }) |entry| if (entry.@"0") |attr| {
-                const accessor = metadata.accessors[attr];
+                .{ prim.indices, .indices, &.{.SCALAR}, &.{ .u8, .u16, .u32 } },
+                .{ prim.attributes.POSITION, .position, &.{.VEC3}, &.{.f32} },
+                .{ prim.attributes.NORMAL, .normal, &.{.VEC3}, &.{.f32} },
+                .{ prim.attributes.TANGENT, .tangent, &.{.VEC4}, &.{.f32} },
+                .{ prim.attributes.TEXCOORD_0, .texcoord_0, &.{.VEC2}, &.{ .u8, .u16, .f32 } },
+                .{ prim.attributes.TEXCOORD_1, .texcoord_1, &.{.VEC2}, &.{ .u8, .u16, .f32 } },
+                .{ prim.attributes.COLOR_0, .color_0, &.{ .VEC3, .VEC4 }, &.{ .u8, .u16, .f32 } },
+                .{ prim.attributes.JOINTS_0, .joints_0, &.{.VEC4}, &.{ .u8, .u16 } },
+                .{ prim.attributes.WEIGHTS_0, .weights_0, &.{.VEC4}, &.{ .u8, .u16, .f32 } },
+            }) |entry| if (entry.@"0") |attr_idx| {
+                const attr_tag = entry.@"1";
+                const attr_types: []const Metadata.Type = entry.@"2";
+                const attr_comp_types: []const Metadata.ComponentType = entry.@"3";
+                const attr = &@field(attrs, @tagName(attr_tag));
+                const AttrType = @typeInfo(@typeInfo(@TypeOf(attr.*)).optional.child).pointer.child;
+
+                const accessor = metadata.accessors[attr_idx];
                 if (accessor.count == 0) return error.InvalidAsset;
                 if (accessor.byteOffset % 4 != 0) return error.InvalidAsset;
+                switch (comptime attr_tag) {
+                    .position => {
+                        if (accessor.min == null) return error.InvalidAsset;
+                        if (accessor.max == null) return error.InvalidAsset;
+                    },
+                    else => {},
+                }
 
                 const buffer_view = metadata.bufferViews[accessor.bufferView];
                 const item_size = accessor.type.size(accessor.componentType);
@@ -582,137 +624,52 @@ pub fn parse(
                     try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
                 const ptr = buffer_data[buffer_view.byteOffset + accessor.byteOffset ..][0..total_size];
 
-                var iter = std.mem.window(u8, ptr, item_size, stride);
+                var iter = mem.window(u8, ptr, item_size, stride);
                 var i: usize = 0;
 
-                switch (entry.@"1") {
-                    .index => {
-                        if (accessor.type != .SCALAR) return error.InvalidAsset;
+                if (mem.indexOfScalar(Metadata.Type, attr_types, accessor.type) == null) return error.InvalidAsset;
+                if (mem.indexOfScalar(Metadata.ComponentType, attr_comp_types, accessor.componentType) == null) return error.InvalidAsset;
 
-                        indices = try allocator.alloc(u32, accessor.count);
+                inline for (attr_types) |ty| if (accessor.type == ty) {
+                    inline for (attr_comp_types) |comp_ty| if (accessor.componentType == comp_ty) {
+                        const attr_size = comptime ty.size(comp_ty);
+                        attr.* = try allocator.alloc(AttrType, accessor.count);
                         while (iter.next()) |slice| : (i += 1) {
-                            indices.?[i] = switch (accessor.componentType) {
-                                .u8 => @as(u8, @bitCast(slice[0..@sizeOf(u8)].*)),
-                                .u16 => @as(u16, @bitCast(slice[0..@sizeOf(u16)].*)),
-                                .u32 => @as(u32, @bitCast(slice[0..@sizeOf(u32)].*)),
-                                else => unreachable,
+                            const bytes = nativeToLittle([attr_size]u8, @bitCast(slice[0..attr_size].*));
+                            const value: ty.ZigType(comp_ty) = @bitCast(bytes);
+                            const attr_item = &attr.*.?[i];
+                            attr_item.* = switch (@typeInfo(AttrType)) {
+                                .vector => |info| blk: {
+                                    if (comptime ty.len() == 3 and info.len == 4) {
+                                        const float_val: @Vector(3, f32) = if (comp_ty == .f32) value else @floatFromInt(value);
+                                        break :blk .{ float_val[0], float_val[1], float_val[2], 1 };
+                                    }
+                                    if (info.child == f32 and comp_ty != .f32) break :blk @floatFromInt(value);
+                                    break :blk value;
+                                },
+                                else => value,
                             };
-                            if (indices.?[i] == accessor.componentType.max()) return error.InvalidAsset;
-                        }
-                    },
-                    .position => {
-                        if (accessor.type != .VEC3) return error.InvalidAsset;
-                        if (accessor.componentType != .f32) return error.InvalidAsset;
-                        if (accessor.min == null) return error.InvalidAsset;
-                        if (accessor.max == null) return error.InvalidAsset;
-
-                        position = try allocator.alloc(@Vector(3, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            position.?[i] = @bitCast(slice[0..@sizeOf([3]f32)].*);
-                        }
-                    },
-                    .normal => {
-                        if (accessor.type != .VEC3) return error.InvalidAsset;
-                        if (accessor.componentType != .f32) return error.InvalidAsset;
-                        normal = try allocator.alloc(@Vector(3, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            normal.?[i] = @bitCast(slice[0..@sizeOf([3]f32)].*);
-                        }
-                    },
-                    .tangent => {
-                        if (accessor.type != .VEC4) return error.InvalidAsset;
-                        if (accessor.componentType != .f32) return error.InvalidAsset;
-                        tangent = try allocator.alloc(@Vector(4, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            tangent.?[i] = @bitCast(slice[0..@sizeOf([4]f32)].*);
-                            if (tangent.?[i][3] < -1 or tangent.?[i][3] > 1) return error.InvalidAsset;
-                        }
-                    },
-                    .texcoord_0 => {
-                        if (accessor.type != .VEC2) return error.InvalidAsset;
-                        texcoord_0 = try allocator.alloc(@Vector(2, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            texcoord_0.?[i] = switch (accessor.componentType) {
-                                .u8 => @floatFromInt(@as(@Vector(2, u8), @bitCast(slice[0..@sizeOf([2]u8)].*))),
-                                .u16 => @floatFromInt(@as(@Vector(2, u16), @bitCast(slice[0..@sizeOf([2]u16)].*))),
-                                .f32 => @bitCast(slice[0..@sizeOf([2]f32)].*),
-                                else => unreachable,
-                            };
-                        }
-                    },
-                    .texcoord_1 => {
-                        if (accessor.type != .VEC2) return error.InvalidAsset;
-                        texcoord_1 = try allocator.alloc(@Vector(2, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            texcoord_1.?[i] = switch (accessor.componentType) {
-                                .u8 => @floatFromInt(@as(@Vector(2, u8), @bitCast(slice[0..@sizeOf([2]u8)].*))),
-                                .u16 => @floatFromInt(@as(@Vector(2, u16), @bitCast(slice[0..@sizeOf([2]u16)].*))),
-                                .f32 => @bitCast(slice[0..@sizeOf([2]f32)].*),
-                                else => unreachable,
-                            };
-                        }
-                    },
-                    .color_0 => {
-                        color_0 = try allocator.alloc(@Vector(4, f32), accessor.count);
-                        if (accessor.type == .VEC4) {
-                            while (iter.next()) |slice| : (i += 1) {
-                                color_0.?[i] = switch (accessor.componentType) {
-                                    .u8 => @floatFromInt(@as(@Vector(4, u8), @bitCast(slice[0..@sizeOf([4]u8)].*))),
-                                    .u16 => @floatFromInt(@as(@Vector(4, u16), @bitCast(slice[0..@sizeOf([4]u16)].*))),
-                                    .f32 => @bitCast(slice[0..@sizeOf([4]f32)].*),
-                                    else => unreachable,
-                                };
+                            switch (comptime attr_tag) {
+                                .index => if (attr_item == comp_ty.max()) return error.InvalidAsset,
+                                .tangent => if (attr_item[3] < -1 or attr_item[3] > 1) return error.InvalidAsset,
+                                else => {},
                             }
-                        } else if (accessor.type == .VEC3) {
-                            while (iter.next()) |slice| : (i += 1) {
-                                const color_rgb: @Vector(3, f32) = switch (accessor.componentType) {
-                                    .u8 => @floatFromInt(@as(@Vector(3, u8), @bitCast(slice[0..@sizeOf([3]u8)].*))),
-                                    .u16 => @floatFromInt(@as(@Vector(3, u16), @bitCast(slice[0..@sizeOf([3]u16)].*))),
-                                    .f32 => @bitCast(slice[0..@sizeOf([3]f32)].*),
-                                    else => unreachable,
-                                };
-                                color_0.?[i] = .{ color_rgb[0], color_rgb[1], color_rgb[2], 1 };
-                            }
-                        } else unreachable;
-                    },
-                    .joints_0 => {
-                        if (accessor.type != .VEC4) return error.InvalidAsset;
-                        joints_0 = try allocator.alloc(@Vector(4, u16), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            joints_0.?[i] = switch (accessor.componentType) {
-                                .u8 => @as(@Vector(4, u8), @bitCast(slice[0..@sizeOf([4]u8)].*)),
-                                .u16 => @as(@Vector(4, u16), @bitCast(slice[0..@sizeOf([4]u16)].*)),
-                                else => unreachable,
-                            };
                         }
-                    },
-                    .weights_0 => {
-                        if (accessor.type != .VEC4) return error.InvalidAsset;
-                        weights_0 = try allocator.alloc(@Vector(4, f32), accessor.count);
-                        while (iter.next()) |slice| : (i += 1) {
-                            weights_0.?[i] = switch (accessor.componentType) {
-                                .u8 => @floatFromInt(@as(@Vector(4, u8), @bitCast(slice[0..@sizeOf([4]u8)].*))),
-                                .u16 => @floatFromInt(@as(@Vector(4, u16), @bitCast(slice[0..@sizeOf([4]u16)].*))),
-                                .f32 => @bitCast(slice[0..@sizeOf([4]f32)].*),
-                                else => unreachable,
-                            };
-                        }
-                    },
-                    else => unreachable,
-                }
+                    };
+                };
             };
 
             out_prim.* = .{
                 .material = prim.material,
-                .indices = indices,
-                .position = position,
-                .normal = normal,
-                .tangent = tangent,
-                .texcoord_0 = texcoord_0,
-                .texcoord_1 = texcoord_1,
-                .color_0 = color_0,
-                .joints_0 = joints_0,
-                .weights_0 = weights_0,
+                .indices = attrs.indices,
+                .position = attrs.position,
+                .normal = attrs.normal,
+                .tangent = attrs.tangent,
+                .texcoord_0 = attrs.texcoord_0,
+                .texcoord_1 = attrs.texcoord_1,
+                .color_0 = attrs.color_0,
+                .joints_0 = attrs.joints_0,
+                .weights_0 = attrs.weights_0,
             };
         }
 
@@ -720,7 +677,7 @@ pub fn parse(
     }
 
     return .{
-        .fba_buf = fba_buf,
+        .arena = arena,
         .scene_name = scene.name,
         .scene_nodes = try allocator.dupe(u16, scene.nodes),
         .nodes = out_nodes,
@@ -731,7 +688,7 @@ pub fn parse(
     };
 }
 
-pub fn deinit(gltf: GLTF, allocator: Allocator) void {
+pub fn deinit(gltf: GLTF) void {
     if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
         for (gltf.materials) |material| {
             if (material.pbr) |pbr| {
@@ -739,7 +696,7 @@ pub fn deinit(gltf: GLTF, allocator: Allocator) void {
             }
         }
     }
-    allocator.free(gltf.fba_buf);
+    gltf.arena.deinit();
 }
 
 fn loadTexture(ptr: []const u8) !Texture {
@@ -769,10 +726,10 @@ fn loadTexture(ptr: []const u8) !Texture {
 
 // TODO: upstream/merge this with std.heap.StackFallbackAllocator
 const FallbackAllocator = struct {
-    fallback: Allocator,
-    fba: FixedBufferAllocator,
+    fallback: mem.Allocator,
+    fba: heap.FixedBufferAllocator,
 
-    pub fn allocator(fa: *FallbackAllocator) Allocator {
+    pub fn allocator(fa: *FallbackAllocator) mem.Allocator {
         return .{
             .ptr = fa,
             .vtable = &.{
@@ -784,22 +741,22 @@ const FallbackAllocator = struct {
         };
     }
 
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    fn alloc(ctx: *anyopaque, len: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
         const fa: *FallbackAllocator = @ptrCast(@alignCast(ctx));
-        return FixedBufferAllocator.alloc(&fa.fba, len, alignment, ra) orelse
+        return heap.FixedBufferAllocator.alloc(&fa.fba, len, alignment, ra) orelse
             fa.fallback.rawAlloc(len, alignment, ra);
     }
 
     fn resize(
         ctx: *anyopaque,
         buf: []u8,
-        alignment: std.mem.Alignment,
+        alignment: mem.Alignment,
         new_len: usize,
         ra: usize,
     ) bool {
         const fa: *FallbackAllocator = @ptrCast(@alignCast(ctx));
         if (fa.fba.ownsPtr(buf.ptr)) {
-            return FixedBufferAllocator.resize(&fa.fba, buf, alignment, new_len, ra);
+            return heap.FixedBufferAllocator.resize(&fa.fba, buf, alignment, new_len, ra);
         }
         return fa.fallback.rawResize(buf, alignment, new_len, ra);
     }
@@ -807,21 +764,21 @@ const FallbackAllocator = struct {
     fn remap(
         context: *anyopaque,
         memory: []u8,
-        alignment: std.mem.Alignment,
+        alignment: mem.Alignment,
         new_len: usize,
         return_address: usize,
     ) ?[*]u8 {
         const fa: *FallbackAllocator = @ptrCast(@alignCast(context));
         if (fa.fba.ownsPtr(memory.ptr)) {
-            return FixedBufferAllocator.remap(&fa.fba, memory, alignment, new_len, return_address);
+            return heap.FixedBufferAllocator.remap(&fa.fba, memory, alignment, new_len, return_address);
         }
         return fa.fallback.rawRemap(memory, alignment, new_len, return_address);
     }
 
-    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    fn free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, ra: usize) void {
         const fa: *FallbackAllocator = @ptrCast(@alignCast(ctx));
         if (fa.fba.ownsPtr(buf.ptr)) {
-            return FixedBufferAllocator.free(&fa.fba, buf, alignment, ra);
+            return heap.FixedBufferAllocator.free(&fa.fba, buf, alignment, ra);
         }
         return fa.fallback.rawFree(buf, alignment, ra);
     }

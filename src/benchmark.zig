@@ -1,6 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const gltf = @import("gltf");
+const GLTF = @import("gltf");
 
 // Declaring this makes the parser ignore loading images
 pub const BENCHMARK_GLTF = {};
@@ -76,11 +76,11 @@ pub fn main() !u8 {
     const runs_node = progress.start("Run", runs.?);
     for (0..runs.?) |_| {
         timer.reset();
-        var bm: gltf.DefaultBufferManager = .empty;
+        var bm: GLTF.DefaultBufferManager = .empty;
         const dirname = std.fs.path.dirname(asset_path.?) orelse "";
         bm.cwd = try std.fs.cwd().openDir(dirname, .{});
-        const model = try gltf.parse(allocator, data, &bm, gltf.DefaultBufferManager.loadUri, .{});
-        defer model.deinit(allocator);
+        const asset = try GLTF.parse(allocator, data, &bm, GLTF.DefaultBufferManager.loadUri, .{});
+        defer asset.deinit();
         const took = timer.read();
         min = @min(took, min);
         max = @max(took, max);
