@@ -1,5 +1,6 @@
 .{
-    .name = "gltf-parser",
+    .name = .gltf_parser,
+    .fingerprint = 0x299516c2faacd319,
     .version = "0.0.0",
     .dependencies = .{
         .stb = .{
