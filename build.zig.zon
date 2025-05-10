@@ -2,6 +2,7 @@
     .name = .gltf_parser,
     .fingerprint = 0x299516c2faacd319,
     .version = "0.0.0",
+    .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .stb = .{
             .url = "https://github.com/nothings/stb/archive/f75e8d1cad7d90d72ef7a4661f1b994ef78b4e31.tar.gz",
