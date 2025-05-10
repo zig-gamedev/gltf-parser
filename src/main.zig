@@ -322,6 +322,37 @@ pub const DefaultBufferManager = struct {
         const data = cwd.readFileAlloc(allocator, uri, len) catch return error.LoadingAsset;
         return data[0..len];
     }
+
+    pub fn loadTexture(
+        bm: *DefaultBufferManager,
+        allocator: mem.Allocator,
+        bytes: []const u8,
+    ) error{LoadingAsset}!Texture {
+        _ = bm;
+        _ = allocator;
+
+        var width: c_int = 0;
+        var height: c_int = 0;
+        var channels_in_file: c_int = 0;
+        var image: [:0]u8 = undefined;
+
+        if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
+            const image_c = stbi.stbi_load_from_memory(
+                bytes.ptr,
+                @intCast(bytes.len),
+                &width,
+                &height,
+                &channels_in_file,
+                4,
+            ) orelse return error.LoadingAsset;
+            image = @ptrCast(image_c[0..@intCast(width * height * 4 + 1)]);
+        }
+        return .{
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .data = image,
+        };
+    }
 };
 
 pub fn parse(
@@ -329,6 +360,7 @@ pub fn parse(
     data: []const u8,
     ctx: anytype,
     loadUri: *const fn (ctx: @TypeOf(ctx), allocator: mem.Allocator, uri: []const u8, len: u32) error{LoadingAsset}![]const u8,
+    loadTexture: *const fn (ctx: @TypeOf(ctx), allocator: mem.Allocator, bytes: []const u8) error{LoadingAsset}!Texture,
     options: Options,
 ) Error!GLTF {
     var fbs = std.io.fixedBufferStream(data);
@@ -437,7 +469,7 @@ pub fn parse(
                     else
                         try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
                     const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                    base_color = try loadTexture(ptr);
+                    base_color = try loadTexture(ctx, allocator, ptr);
                 }
 
                 var metallic_roughness: ?Texture = null;
@@ -452,7 +484,7 @@ pub fn parse(
                     else
                         try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
                     const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                    metallic_roughness = try loadTexture(ptr);
+                    metallic_roughness = try loadTexture(ctx, allocator, ptr);
                 }
 
                 pbr = .{
@@ -473,7 +505,7 @@ pub fn parse(
                 else
                     try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
                 const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                normal = try loadTexture(ptr);
+                normal = try loadTexture(ctx, allocator, ptr);
             }
 
             out_material.* = .{
@@ -697,31 +729,6 @@ pub fn deinit(gltf: GLTF) void {
         }
     }
     gltf.arena.deinit();
-}
-
-fn loadTexture(ptr: []const u8) !Texture {
-    var width: c_int = 0;
-    var height: c_int = 0;
-    var channels_in_file: c_int = 0;
-    var image: [:0]u8 = undefined;
-
-    if (!@hasDecl(@import("root"), "BENCHMARK_GLTF")) {
-        const image_c = stbi.stbi_load_from_memory(
-            ptr.ptr,
-            @intCast(ptr.len),
-            &width,
-            &height,
-            &channels_in_file,
-            4,
-        ) orelse return error.LoadingAsset;
-        image = @ptrCast(image_c[0..@intCast(width * height * 4 + 1)]);
-    }
-
-    return .{
-        .width = @intCast(width),
-        .height = @intCast(height),
-        .data = image,
-    };
 }
 
 // TODO: upstream/merge this with std.heap.StackFallbackAllocator

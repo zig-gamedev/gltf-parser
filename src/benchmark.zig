@@ -79,7 +79,14 @@ pub fn main() !u8 {
         var bm: GLTF.DefaultBufferManager = .empty;
         const dirname = std.fs.path.dirname(asset_path.?) orelse "";
         bm.cwd = try std.fs.cwd().openDir(dirname, .{});
-        const asset = try GLTF.parse(allocator, data, &bm, GLTF.DefaultBufferManager.loadUri, .{});
+        const asset = try GLTF.parse(
+            allocator,
+            data,
+            &bm,
+            GLTF.DefaultBufferManager.loadUri,
+            GLTF.DefaultBufferManager.loadTexture,
+            .{},
+        );
         defer asset.deinit();
         const took = timer.read();
         min = @min(took, min);
