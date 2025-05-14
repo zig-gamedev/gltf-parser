@@ -63,7 +63,7 @@ pub fn main() !u8 {
 
     const file = try std.fs.cwd().openFile(asset_path.?, .{});
     defer file.close();
-    const data = try file.readToEndAllocOptions(allocator, 100 * 1024 * 1024, null, @alignOf(u8), 0);
+    const data = try file.readToEndAllocOptions(allocator, 100 * 1024 * 1024, null, .of(u8), 0);
     defer allocator.free(data);
 
     var timer = try std.time.Timer.start();
@@ -78,7 +78,7 @@ pub fn main() !u8 {
         timer.reset();
         var bm: GLTF.DefaultBufferManager = .empty;
         const dirname = std.fs.path.dirname(asset_path.?) orelse "";
-        bm.cwd = try std.fs.cwd().openDir(dirname, .{});
+        bm.root_dir = try std.fs.cwd().openDir(dirname, .{});
         const asset = try GLTF.parse(allocator, data, &bm, GLTF.DefaultBufferManager.loadUri, .{});
         defer asset.deinit();
         const took = timer.read();

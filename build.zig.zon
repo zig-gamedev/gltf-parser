@@ -5,7 +5,7 @@
     .dependencies = .{
         .stb = .{
             .url = "https://github.com/nothings/stb/archive/f75e8d1cad7d90d72ef7a4661f1b994ef78b4e31.tar.gz",
-            .hash = "1220c4fe5a4c4ebec402f5cdef08bc264b56fb07f259107d2b01ba8d416d88624b50",
+            .hash = "N-V-__8AAEcaTgDE_lpMTr7EAvXN7wi8JktW-wfyWRB9KwG6",
         },
     },
     .paths = .{

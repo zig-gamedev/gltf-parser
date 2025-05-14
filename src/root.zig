@@ -159,13 +159,14 @@ const Metadata = struct {
         } = null,
     } = &.{},
     textures: []struct {
-        sampler: u16,
+        sampler: ?u16 = null,
         source: u16,
     } = &.{},
     images: []struct {
         name: ?[]u8 = null,
-        mimeType: []u8,
-        bufferView: u16,
+        uri: ?[]u8 = null,
+        mimeType: ?[]u8 = null,
+        bufferView: ?u16 = null,
     } = &.{},
     animations: []struct {
         name: ?[]u8 = null,
@@ -298,15 +299,15 @@ pub const Options = struct {
 };
 
 pub const DefaultBufferManager = struct {
-    cwd: ?std.fs.Dir,
+    root_dir: ?std.fs.Dir,
 
-    pub const empty: DefaultBufferManager = .{ .cwd = null };
+    pub const empty: DefaultBufferManager = .{ .root_dir = null };
 
     pub fn loadUri(
         bm: *DefaultBufferManager,
         allocator: mem.Allocator,
         uri: []const u8,
-        len: u32,
+        len: ?u32,
     ) error{LoadingAsset}![]const u8 {
         if (std.Uri.parse(uri)) |puri| {
             const i = mem.indexOf(u8, puri.path.percent_encoded, "base64,") orelse return error.LoadingAsset;
@@ -314,13 +315,13 @@ pub const DefaultBufferManager = struct {
             const base64_len = base64.Decoder.calcSizeForSlice(base64_data) catch return error.LoadingAsset;
             const data = allocator.alloc(u8, base64_len) catch return error.LoadingAsset;
             base64.Decoder.decode(data, base64_data) catch return error.LoadingAsset;
-            if (data.len != len) return error.LoadingAsset;
+            if (len != null and data.len != len.?) return error.LoadingAsset;
             return data;
         } else |_| {}
 
-        const cwd = if (bm.cwd) |cwd| cwd else std.fs.cwd();
-        const data = cwd.readFileAlloc(allocator, uri, len) catch return error.LoadingAsset;
-        return data[0..len];
+        const cwd = if (bm.root_dir) |root_dir| root_dir else std.fs.cwd();
+        const data = cwd.readFileAlloc(allocator, uri, len orelse std.math.maxInt(usize)) catch return error.LoadingAsset;
+        return data[0 .. len orelse data.len];
     }
 };
 
@@ -328,7 +329,7 @@ pub fn parse(
     gpa: mem.Allocator,
     data: []const u8,
     ctx: anytype,
-    loadUri: *const fn (ctx: @TypeOf(ctx), allocator: mem.Allocator, uri: []const u8, len: u32) error{LoadingAsset}![]const u8,
+    loadUri: *const fn (ctx: @TypeOf(ctx), allocator: mem.Allocator, uri: []const u8, len: ?u32) error{LoadingAsset}![]const u8,
     options: Options,
 ) Error!GLTF {
     var fbs = std.io.fixedBufferStream(data);
@@ -429,30 +430,44 @@ pub fn parse(
                 if (pbr_metallic_roughness.baseColorTexture) |tex_index| {
                     const tex = metadata.textures[tex_index.index];
                     const img = metadata.images[tex.source];
-                    const buffer_view = metadata.bufferViews[img.bufferView];
-                    if (buffer_view.byteStride != null) return error.InvalidAsset;
-                    const buffer = metadata.buffers[buffer_view.buffer];
-                    const buffer_data = if (is_bin)
-                        data[fbs.pos..][0..buffer.byteLength]
-                    else
-                        try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
-                    const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                    base_color = try loadTexture(ptr);
+
+                    if (img.uri) |uri| {
+                        const buffer_data = try loadUri(ctx, allocator, uri, null);
+                        base_color = try loadTexture(buffer_data);
+                    } else {
+                        const buffer_view = metadata.bufferViews[img.bufferView.?];
+                        if (buffer_view.byteStride != null) return error.InvalidAsset;
+
+                        const buffer = metadata.buffers[buffer_view.buffer];
+                        const buffer_data = if (is_bin)
+                            data[fbs.pos..][0..buffer.byteLength]
+                        else
+                            try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
+                        const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                        base_color = try loadTexture(ptr);
+                    }
                 }
 
                 var metallic_roughness: ?Texture = null;
                 if (pbr_metallic_roughness.metallicRoughnessTexture) |tex_index| {
                     const tex = metadata.textures[tex_index.index];
                     const img = metadata.images[tex.source];
-                    const buffer_view = metadata.bufferViews[img.bufferView];
-                    if (buffer_view.byteStride != null) return error.InvalidAsset;
-                    const buffer = metadata.buffers[buffer_view.buffer];
-                    const buffer_data = if (is_bin)
-                        data[fbs.pos..][0..buffer.byteLength]
-                    else
-                        try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
-                    const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                    metallic_roughness = try loadTexture(ptr);
+
+                    if (img.uri) |uri| {
+                        const buffer_data = try loadUri(ctx, allocator, uri, null);
+                        metallic_roughness = try loadTexture(buffer_data);
+                    } else {
+                        const buffer_view = metadata.bufferViews[img.bufferView.?];
+                        if (buffer_view.byteStride != null) return error.InvalidAsset;
+
+                        const buffer = metadata.buffers[buffer_view.buffer];
+                        const buffer_data = if (is_bin)
+                            data[fbs.pos..][0..buffer.byteLength]
+                        else
+                            try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
+                        const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                        metallic_roughness = try loadTexture(ptr);
+                    }
                 }
 
                 pbr = .{
@@ -465,15 +480,22 @@ pub fn parse(
             if (material.normalTexture) |tex_index| {
                 const tex = metadata.textures[tex_index.index];
                 const img = metadata.images[tex.source];
-                const buffer_view = metadata.bufferViews[img.bufferView];
-                if (buffer_view.byteStride != null) return error.InvalidAsset;
-                const buffer = metadata.buffers[buffer_view.buffer];
-                const buffer_data = if (is_bin)
-                    data[fbs.pos..][0..buffer.byteLength]
-                else
-                    try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
-                const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
-                normal = try loadTexture(ptr);
+
+                if (img.uri) |uri| {
+                    const buffer_data = try loadUri(ctx, allocator, uri, null);
+                    normal = try loadTexture(buffer_data);
+                } else {
+                    const buffer_view = metadata.bufferViews[img.bufferView.?];
+                    if (buffer_view.byteStride != null) return error.InvalidAsset;
+
+                    const buffer = metadata.buffers[buffer_view.buffer];
+                    const buffer_data = if (is_bin)
+                        data[fbs.pos..][0..buffer.byteLength]
+                    else
+                        try loadUri(ctx, allocator, buffer.uri.?, buffer.byteLength);
+                    const ptr = buffer_data[buffer_view.byteOffset..][0..buffer_view.byteLength];
+                    normal = try loadTexture(ptr);
+                }
             }
 
             out_material.* = .{

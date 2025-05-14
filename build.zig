@@ -32,7 +32,7 @@ pub fn build(b: *Build) void {
 
     // Module
     const module = b.addModule("gltf", .{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -55,7 +55,7 @@ pub fn build(b: *Build) void {
         .name = "benchmark",
         .root_source_file = b.path("src/benchmark.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     benchmark.root_module.addImport("gltf", module);
     benchmark.root_module.addImport("build_options", build_options_module);
